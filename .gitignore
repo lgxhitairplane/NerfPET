@@ -7,3 +7,9 @@
 *.dae
 data/*
 logs/*
+test/output/*test/output/
+*.mich
+test/output/
+*.mich
+test/output/
+*.mich
