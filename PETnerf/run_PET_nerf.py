@@ -3,7 +3,6 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import time
 
-import imageio
 import numpy as np
 import tensorflow as tf
 
@@ -244,7 +243,9 @@ def run_pet_network(points, angles, fn, embed_pts_fn, netchunk=1024 * 64):
         [fn(embedded[i:i + netchunk])
          for i in range(0, embedded.shape[0], netchunk)],
         axis=0)
-    outputs = tf.reshape(outputs_flat, list(points.shape[:-1]) + [2])
+    outputs = tf.reshape(
+        outputs_flat,
+        list(points.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
 
@@ -260,22 +261,25 @@ def activate_pet_raw(raw, raw_activation='softplus', density_max=0.015):
         intensity = tf.nn.softplus(raw[..., 0])
     else:
         raise ValueError('Unknown PET raw activation: {}'.format(raw_activation))
-    density = tf.math.sigmoid(raw[..., 1]) * density_max
+    if raw.shape[-1] == 1:
+        density = tf.zeros_like(intensity)
+    else:
+        density = tf.math.sigmoid(raw[..., 1]) * density_max
     return intensity, density
 
 
 def raw2pet_outputs(raw, z_vals, raw_activation='softplus',
-                    density_max=0.015):
+                    density_max=0.015, density_override=None,
+                    activity_mask=None):
     """Project PET-NeRF raw predictions along each LOR.
 
-    The network predicts light intensity c(x, d) and density sigma(x, d).
-    Each point contributes like NeRF, using alpha from the local density and
-    interval length. For PET coincidence detection, the accumulated
-    transmittance is shared by every possible emission point on the same LOR:
+    The network predicts PET activity c(x) and attenuation density mu(x).
+    A coincidence event can originate anywhere along the LOR, while attenuation
+    affects the full path. Therefore the expected count is the activity line
+    integral multiplied by the total LOR transmission:
 
-      alpha_i = 1 - exp(-sigma_i * delta_i)
-      T_LOR = exp(-sum_i sigma_i * delta_i)
-      y = T_LOR * sum_i alpha_i * c_i
+      T_LOR = exp(-sum_i mu_i * delta_i)
+      y = T_LOR * sum_i c_i * delta_i
     """
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -285,17 +289,21 @@ def raw2pet_outputs(raw, z_vals, raw_activation='softplus',
         raw,
         raw_activation=raw_activation,
         density_max=density_max)
+    if density_override is not None:
+        density = tf.maximum(density_override, 0.)
+    if activity_mask is not None:
+        intensity = intensity * activity_mask
 
     alpha = 1. - tf.exp(-density * dists)
     density_integral = tf.reduce_sum(density * dists, axis=-1)
     transmission = tf.exp(-density_integral)
-    intensity_alpha_sum = tf.reduce_sum(alpha * intensity, axis=-1)
-    weights = transmission[..., None] * alpha
-    count = tf.reduce_sum(weights * intensity, axis=-1)
+    activity_integral = tf.reduce_sum(intensity * dists, axis=-1)
+    weights = transmission[..., None] * intensity * dists
+    count = transmission * activity_integral
 
     return {
         'count': count[..., None],
-        'intensity_alpha_sum': intensity_alpha_sum,
+        'intensity_alpha_sum': activity_integral,
         'density_integral': density_integral,
         'transmission': transmission,
         'alpha': alpha,
@@ -304,17 +312,119 @@ def raw2pet_outputs(raw, z_vals, raw_activation='softplus',
         'density': density,
         'dists': dists,
         # Backward-compatible aliases for existing experiment scripts.
-        'activity_integral': intensity_alpha_sum,
+        'activity_integral': activity_integral,
         'mu_integral': density_integral,
         'activity': intensity,
         'mu': density,
     }
 
 
+def load_attn_map(path, shape=None, dtype='float32', header_bytes=0):
+    """Load a fixed attenuation map used as mu instead of a learned field."""
+    dtype = np.dtype(dtype)
+
+    if path.endswith('.npy'):
+        attn = np.load(path).astype(np.float32)
+    elif path.endswith('.npz'):
+        data = np.load(path)
+        key = 'mu' if 'mu' in data else 'attn'
+        if key not in data:
+            key = 'density' if 'density' in data else data.files[0]
+        attn = data[key].astype(np.float32)
+    else:
+        if shape is None:
+            raise ValueError('--attn_shape is required for raw attenuation maps.')
+        shape = tuple(int(x) for x in shape)
+        expected_values = int(np.prod(shape))
+        payload_bytes = os.path.getsize(path) - header_bytes
+        expected_bytes = expected_values * dtype.itemsize
+        if payload_bytes != expected_bytes:
+            raise ValueError(
+                '{} contains {} payload bytes, but shape {} with dtype {} '
+                'expects {} bytes.'.format(
+                    path, payload_bytes, shape, dtype, expected_bytes))
+        attn = np.memmap(
+            path,
+            dtype=dtype,
+            mode='r',
+            offset=header_bytes,
+            shape=shape,
+        ).astype(np.float32)
+
+    if shape is not None:
+        shape = tuple(int(x) for x in shape)
+        if attn.size != int(np.prod(shape)):
+            raise ValueError(
+                'Attenuation map has {} values, but shape {} expects {}.'.format(
+                    attn.size, shape, int(np.prod(shape))))
+        attn = attn.reshape(shape)
+
+    attn = np.squeeze(attn).astype(np.float32)
+    if attn.ndim != 2:
+        raise ValueError(
+            'Only 2D attenuation maps are currently supported, got shape {}.'.format(
+                attn.shape))
+    return attn
+
+
+def query_attn_map_2d(points, attn_map, bounds, outside_value=0.):
+    """Bilinearly query mu from a 2D attenuation image at sampled LOR points."""
+    xmin, xmax, ymin, ymax = bounds
+    height = tf.shape(attn_map)[0]
+    width = tf.shape(attn_map)[1]
+    x = points[..., 0]
+    y = points[..., 1]
+
+    gx = (x - xmin) / tf.maximum(xmax - xmin, 1e-8) * tf.cast(width - 1, tf.float32)
+    gy = (y - ymin) / tf.maximum(ymax - ymin, 1e-8) * tf.cast(height - 1, tf.float32)
+    inside = tf.logical_and(
+        tf.logical_and(gx >= 0., gx <= tf.cast(width - 1, tf.float32)),
+        tf.logical_and(gy >= 0., gy <= tf.cast(height - 1, tf.float32)))
+
+    gx = tf.clip_by_value(gx, 0., tf.cast(width - 1, tf.float32))
+    gy = tf.clip_by_value(gy, 0., tf.cast(height - 1, tf.float32))
+    x0 = tf.cast(tf.floor(gx), tf.int32)
+    y0 = tf.cast(tf.floor(gy), tf.int32)
+    x1 = tf.minimum(x0 + 1, width - 1)
+    y1 = tf.minimum(y0 + 1, height - 1)
+
+    wx = gx - tf.cast(x0, tf.float32)
+    wy = gy - tf.cast(y0, tf.float32)
+    v00 = tf.gather_nd(attn_map, tf.stack([y0, x0], axis=-1))
+    v10 = tf.gather_nd(attn_map, tf.stack([y0, x1], axis=-1))
+    v01 = tf.gather_nd(attn_map, tf.stack([y1, x0], axis=-1))
+    v11 = tf.gather_nd(attn_map, tf.stack([y1, x1], axis=-1))
+    values = (
+        v00 * (1. - wx) * (1. - wy) +
+        v10 * wx * (1. - wy) +
+        v01 * (1. - wx) * wy +
+        v11 * wx * wy)
+    return tf.where(inside, values, tf.ones_like(values) * outside_value)
+
+
+def soft_activity_mask_from_mu(mu, threshold=1e-5, softness=1e-4):
+    softness = tf.maximum(tf.cast(softness, mu.dtype), tf.cast(1e-12, mu.dtype))
+    threshold = tf.cast(threshold, mu.dtype)
+    return tf.sigmoid((mu - threshold) / softness)
+
+
+def mask_fov_outputs(outputs, fov_hit_flat, keys):
+    for key in keys:
+        condition = fov_hit_flat
+        if len(outputs[key].shape) > 1:
+            condition = fov_hit_flat[..., None]
+            condition = tf.broadcast_to(condition, tf.shape(outputs[key]))
+        outputs[key] = tf.where(
+            condition,
+            outputs[key],
+            tf.zeros_like(outputs[key]))
+
+
 def render_lors(lor_batch, network_fn, network_query_fn, N_samples,
                 perturb=0., N_importance=0, network_fine=None,
                 raw_activation='softplus', density_max=0.015,
-                fov_bounds=None):
+                fov_bounds=None, attn_map=None, attn_bounds=None,
+                attn_activity_soft_mask=False):
     """Render a batch of PET LORs.
 
     lor_batch shape: [N_lors, 6]
@@ -347,20 +457,27 @@ def render_lors(lor_batch, network_fn, network_query_fn, N_samples,
 
     points = crystal1[:, None, :] + lor_dirs[:, None, :] * z_vals[..., None]
     raw = network_query_fn(points, None, network_fn)
+    density_override = None
+    activity_mask = None
+    if attn_map is not None:
+        density_override = query_attn_map_2d(points, attn_map, attn_bounds)
+        if attn_activity_soft_mask:
+            activity_mask = soft_activity_mask_from_mu(density_override)
     outputs = raw2pet_outputs(
         raw,
         z_vals,
         raw_activation=raw_activation,
-        density_max=density_max)
+        density_max=density_max,
+        density_override=density_override,
+        activity_mask=activity_mask)
     fov_hit_flat = tf.squeeze(fov_hit, axis=-1)
-    for key in ['count', 'intensity_alpha_sum', 'density_integral',
-                'transmission', 'alpha', 'weights', 'intensity', 'density',
-                'dists', 'activity_integral', 'mu_integral',
-                'activity', 'mu']:
-        outputs[key] = tf.where(
-            fov_hit_flat[..., None] if len(outputs[key].shape) > 1 else fov_hit_flat,
-            outputs[key],
-            tf.zeros_like(outputs[key]))
+    mask_fov_outputs(
+        outputs,
+        fov_hit_flat,
+        ['count', 'intensity_alpha_sum', 'density_integral',
+         'transmission', 'alpha', 'weights', 'intensity', 'density',
+         'dists', 'activity_integral', 'mu_integral',
+         'activity', 'mu'])
 
     outputs.update({
         'raw': raw,
@@ -389,19 +506,26 @@ def render_lors(lor_batch, network_fn, network_query_fn, N_samples,
 
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(points, None, run_fn)
+        density_override = None
+        activity_mask = None
+        if attn_map is not None:
+            density_override = query_attn_map_2d(points, attn_map, attn_bounds)
+            if attn_activity_soft_mask:
+                activity_mask = soft_activity_mask_from_mu(density_override)
         outputs = raw2pet_outputs(
             raw,
             z_vals,
             raw_activation=raw_activation,
-            density_max=density_max)
-        for key in ['count', 'intensity_alpha_sum', 'density_integral',
-                    'transmission', 'alpha', 'weights', 'intensity', 'density',
-                    'dists', 'activity_integral', 'mu_integral',
-                    'activity', 'mu']:
-            outputs[key] = tf.where(
-                fov_hit_flat[..., None] if len(outputs[key].shape) > 1 else fov_hit_flat,
-                outputs[key],
-                tf.zeros_like(outputs[key]))
+            density_max=density_max,
+            density_override=density_override,
+            activity_mask=activity_mask)
+        mask_fov_outputs(
+            outputs,
+            fov_hit_flat,
+            ['count', 'intensity_alpha_sum', 'density_integral',
+             'transmission', 'alpha', 'weights', 'intensity', 'density',
+             'dists', 'activity_integral', 'mu_integral',
+             'activity', 'mu'])
         outputs.update({
             'raw': raw,
             'z_vals': z_vals,
@@ -420,12 +544,15 @@ def render_lors(lor_batch, network_fn, network_query_fn, N_samples,
 
 def create_pet_nerf(args):
     embed_pts_fn, input_ch_pts = get_embedder(3, args.multires, args.i_embed)
+    use_attn_map = getattr(args, 'attn_image', None) is not None
+    output_ch = 1 if use_attn_map else 2
 
     model = init_pet_nerf_model(
         D=args.netdepth,
         W=args.netwidth,
         input_ch_pts=input_ch_pts,
-        output_ch=2,
+        output_ch=output_ch,
+        skips=args.net_skips_parsed,
     )
     grad_vars = model.trainable_variables
     models = {'model': model}
@@ -436,7 +563,8 @@ def create_pet_nerf(args):
             D=args.netdepth_fine,
             W=args.netwidth_fine,
             input_ch_pts=input_ch_pts,
-            output_ch=2,
+            output_ch=output_ch,
+            skips=args.net_skips_parsed,
         )
         grad_vars += model_fine.trainable_variables
         models['model_fine'] = model_fine
@@ -458,6 +586,24 @@ def create_pet_nerf(args):
         'density_max': args.density_max,
         'fov_bounds': getattr(args, 'fov_bounds_parsed', None),
     }
+    if use_attn_map:
+        attn_map = load_attn_map(
+            args.attn_image,
+            shape=getattr(args, 'attn_shape_parsed', None),
+            dtype=args.attn_dtype,
+            header_bytes=args.attn_header_bytes)
+        render_kwargs_train['attn_map'] = tf.convert_to_tensor(
+            attn_map, dtype=tf.float32)
+        render_kwargs_train['attn_bounds'] = [
+            float(x) for x in args.attn_bounds_parsed]
+        render_kwargs_train['attn_activity_soft_mask'] = (
+            args.attn_activity_soft_mask)
+        print('Using fixed attenuation map')
+        print('  attn_image', args.attn_image)
+        print('  attn_shape', attn_map.shape)
+        print('  attn_range', float(attn_map.min()), float(attn_map.max()))
+        print('  attn_bounds', args.attn_bounds_parsed)
+        print('  attn_activity_soft_mask', args.attn_activity_soft_mask)
     render_kwargs_test = dict(render_kwargs_train)
     render_kwargs_test['perturb'] = 0.
 
@@ -560,12 +706,32 @@ def parse_int3(value):
     return parts
 
 
+def parse_int2_or_3(value):
+    parts = [int(x) for x in str(value).split(',')]
+    if len(parts) not in (2, 3):
+        raise ValueError('Expected two or three comma-separated ints.')
+    return parts
+
+
+def parse_int_list(value):
+    if value is None or str(value).strip() == '':
+        return []
+    return [int(x) for x in str(value).split(',') if str(x).strip() != '']
+
+
 def parse_float3(value):
     parts = [float(x) for x in str(value).split(',')]
     if len(parts) == 1:
         return parts * 3
     if len(parts) != 3:
         raise ValueError('Expected one float or three comma-separated floats.')
+    return parts
+
+
+def parse_float4(value):
+    parts = [float(x) for x in str(value).split(',')]
+    if len(parts) != 4:
+        raise ValueError('Expected bounds as xmin,xmax,ymin,ymax.')
     return parts
 
 
@@ -599,6 +765,20 @@ def get_fov_bounds(args):
     xmin, xmax, ymin, ymax, zmin, zmax = bounds
     if xmin >= xmax or ymin >= ymax or zmin >= zmax:
         raise ValueError('FOV bounds must satisfy min < max on every axis.')
+    return [float(x) for x in bounds]
+
+
+def get_attn_bounds(args, scanner):
+    if args.attn_image is None:
+        return None
+    if args.attn_bounds is not None:
+        bounds = parse_float4(args.attn_bounds)
+    else:
+        radius = scanner.get_radius()
+        bounds = [-radius, radius, -radius, radius]
+    xmin, xmax, ymin, ymax = bounds
+    if xmin >= xmax or ymin >= ymax:
+        raise ValueError('Attenuation bounds must satisfy min < max on x/y.')
     return [float(x) for x in bounds]
 
 
@@ -638,7 +818,9 @@ def get_volume_directions(mode):
 
 
 def query_pet_field(points, directions, model, network_query_fn, chunk,
-                    raw_activation='softplus', density_max=0.015):
+                    raw_activation='softplus', density_max=0.015,
+                    attn_map=None, attn_bounds=None,
+                    attn_activity_soft_mask=False):
     """Query intensity/density on flat 3D points."""
     intensity_parts = []
     density_parts = []
@@ -650,6 +832,13 @@ def query_pet_field(points, directions, model, network_query_fn, chunk,
             raw,
             raw_activation=raw_activation,
             density_max=density_max)
+        if attn_map is not None:
+            density = query_attn_map_2d(
+                pts,
+                attn_map,
+                attn_bounds)[0]
+            if attn_activity_soft_mask:
+                intensity = intensity * soft_activity_mask_from_mu(density)
         intensity_parts.append(intensity.numpy())
         density_parts.append(density.numpy())
 
@@ -760,7 +949,11 @@ def export_pet_volume(args):
         render_kwargs_train['network_query_fn'],
         args.volume_chunk,
         raw_activation=args.raw_activation,
-        density_max=args.density_max)
+        density_max=args.density_max,
+        attn_map=render_kwargs_train.get('attn_map'),
+        attn_bounds=render_kwargs_train.get('attn_bounds'),
+        attn_activity_soft_mask=render_kwargs_train.get(
+            'attn_activity_soft_mask', False))
     intensity = intensity.reshape([nx, ny, nz])
     density = density.reshape([nx, ny, nz])
 
@@ -880,6 +1073,8 @@ def render_pet_camera(
 
 def render_pet_path(args):
     """Render PET-NeRF from a NeRF-like orbit camera path."""
+    import imageio
+
     if args.ft_weights is None:
         raise ValueError('--ft_weights is required when rendering views.')
 
@@ -982,6 +1177,8 @@ def config_parser():
     parser.add_argument('--netwidth', type=int, default=256)
     parser.add_argument('--netdepth_fine', type=int, default=8)
     parser.add_argument('--netwidth_fine', type=int, default=256)
+    parser.add_argument('--net_skips', type=str, default='4',
+                        help='comma-separated hidden layer indices with skip connections')
     parser.add_argument('--N_rand', type=int, default=4096)
     parser.add_argument('--N_iters', type=int, default=1000000)
     parser.add_argument('--lrate', type=float, default=5e-4)
@@ -1024,6 +1221,18 @@ def config_parser():
                         help='positive activation for activity/intensity output')
     parser.add_argument('--density_max', type=float, default=0.015,
                         help='upper bound for attenuation density/mu; density is sigmoid(raw) * density_max')
+    parser.add_argument('--attn_image', type=str, default=None,
+                        help='fixed 2D attenuation/mu map; when set, PET-NeRF predicts activity only')
+    parser.add_argument('--attn_shape', type=str, default=None,
+                        help='attenuation map shape for raw files, height,width or height,width,1')
+    parser.add_argument('--attn_dtype', type=str, default='float32',
+                        help='dtype for raw attenuation maps')
+    parser.add_argument('--attn_header_bytes', type=int, default=0,
+                        help='bytes to skip before raw attenuation map payload')
+    parser.add_argument('--attn_bounds', type=str, default=None,
+                        help='attenuation image bounds xmin,xmax,ymin,ymax; default uses scanner radius')
+    parser.add_argument('--attn_activity_soft_mask', action='store_true',
+                        help='multiply activity by a soft support mask from fixed mu; disabled by default')
     parser.add_argument('--i_print', type=int, default=100)
     parser.add_argument('--i_weights', type=int, default=20000)
     parser.add_argument('--random_seed', type=int, default=None)
@@ -1078,6 +1287,14 @@ def train(argv=None):
     parser = config_parser()
     args = parser.parse_args(argv)
 
+    scanner = PETScanner(get_scanner_config(args.scanner))
+    args.fov_bounds_parsed = get_fov_bounds(args)
+    args.net_skips_parsed = parse_int_list(args.net_skips)
+    args.attn_shape_parsed = (
+        parse_int2_or_3(args.attn_shape)
+        if args.attn_shape is not None else None)
+    args.attn_bounds_parsed = get_attn_bounds(args, scanner)
+
     if args.render_views:
         return render_pet_path(args)
 
@@ -1088,8 +1305,6 @@ def train(argv=None):
         np.random.seed(args.random_seed)
         tf.compat.v1.set_random_seed(args.random_seed)
 
-    scanner = PETScanner(get_scanner_config(args.scanner))
-    args.fov_bounds_parsed = get_fov_bounds(args)
     if args.N_samples <= 0:
         if args.fov_bounds_parsed is None:
             args.N_samples, max_lor_length = estimate_n_samples_from_scanner(

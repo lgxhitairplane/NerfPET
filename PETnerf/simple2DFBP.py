@@ -221,6 +221,20 @@ def project_cylinders(s_by_bin_view, theta, cylinder_specs):
     return projection
 
 
+def rasterize_cylinders(bounds, image_size, cylinder_specs):
+    """Rasterize analytic 2D cylinders into a y,x image map."""
+    xmin, xmax, ymin, ymax = bounds
+    xs = np.linspace(xmin, xmax, image_size, dtype=np.float32)
+    ys = np.linspace(ymin, ymax, image_size, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys, indexing="xy")
+    image = np.zeros_like(xx, dtype=np.float32)
+
+    for cx, cy, radius, value in cylinder_specs:
+        inside = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2
+        image[inside] += value
+    return image.astype(np.float32), xs, ys
+
+
 def attenuation_factor_from_cylinders(s_by_bin_view, theta, attenuation_specs):
     """Return PET attenuation factor exp(- integral mu dl) for each LOR."""
     if not attenuation_specs:
@@ -303,6 +317,78 @@ def save_outputs(recon, xs, ys, output_npz, output_png):
     fig.savefig(output_png)
     plt.close(fig)
     print("saved", output_png)
+
+
+def save_attn_map(mu_map, xs, ys, bounds, attenuation_specs,
+                  output_npz=None, output_png=None):
+    if output_npz is not None:
+        ensure_parent_dir(output_npz)
+        np.savez_compressed(
+            output_npz,
+            # y,x image layout for direct use with test2DPET_attn.py.
+            mu=mu_map,
+            attnMap=mu_map,
+            density=mu_map,
+            # x,y,z volume-style alias for tools that expect volume[x,y,z].
+            mu_volume=mu_map.T[:, :, None],
+            x=xs,
+            y=ys,
+            z=np.asarray([0.], dtype=np.float32),
+            bounds=np.asarray(bounds, dtype=np.float32),
+            attenuation_cylinders=np.asarray(
+                attenuation_specs, dtype=np.float32),
+        )
+        print("saved", output_npz)
+
+    if output_png is not None:
+        ensure_parent_dir(output_png)
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=180)
+        im = ax.imshow(
+            mu_map,
+            origin="lower",
+            cmap="viridis",
+            extent=[xs[0], xs[-1], ys[0], ys[-1]])
+        ax.set_title("DigitMI2D attenuation map")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        fig.colorbar(im, ax=ax, label="mu")
+        fig.tight_layout()
+        fig.savefig(output_png)
+        plt.close(fig)
+        print("saved", output_png)
+
+
+def derived_attn_output_path(output_npz, suffix, extension):
+    base = os.path.splitext(output_npz)[0]
+    return base + suffix + extension
+
+
+def save_attn_map_from_args(bounds, attenuation_specs, args):
+    if not attenuation_specs:
+        return None
+
+    mu_map, mu_xs, mu_ys = rasterize_cylinders(
+        bounds,
+        args.attn_map_size,
+        attenuation_specs)
+    attn_npz = args.output_attn_npz
+    if attn_npz is None and not args.no_attn_map:
+        attn_npz = derived_attn_output_path(
+            args.output_npz, "_attn_map", ".npz")
+    attn_png = args.output_attn_png
+    if attn_png is None and not args.no_attn_map_png:
+        attn_png = derived_attn_output_path(
+            args.output_npz, "_attn_map", ".png")
+    if attn_npz is not None or attn_png is not None:
+        save_attn_map(
+            mu_map,
+            mu_xs,
+            mu_ys,
+            bounds,
+            attenuation_specs,
+            output_npz=attn_npz,
+            output_png=attn_png)
+    return mu_map
 
 
 def voxel_spacing(axis_values):
@@ -407,6 +493,7 @@ def run_demo_cylinder(args):
     attenuation_specs = (
         parse_cylinder_specs(args.attenuation_cylinders)
         if args.attenuation_cylinders is not None else [])
+    mu_map = save_attn_map_from_args(bounds, attenuation_specs, args)
 
     activity_sino = project_cylinders(
         s_by_bin_view,
@@ -480,6 +567,9 @@ def run_demo_cylinder(args):
           float(measured_sino.max()))
     print("attenuation_factor_range:", float(attenuation_factor.min()),
           float(attenuation_factor.max()))
+    if mu_map is not None:
+        print("attn_map_shape:", mu_map.shape)
+        print("attn_map_range:", float(mu_map.min()), float(mu_map.max()))
     print("image_shape:", recon.shape)
     print("image_range:", float(recon.min()), float(recon.max()))
     save_outputs(recon, xs, ys, args.output_npz, args.output_png)
@@ -535,6 +625,7 @@ def run_fbp(args):
         bounds = [-radius, radius, -radius, radius]
     else:
         bounds = parse_float4(args.bounds)
+    mu_map = save_attn_map_from_args(bounds, attenuation_specs, args)
 
     recon, xs, ys = filtered_backprojection(
         filtered,
@@ -556,6 +647,9 @@ def run_fbp(args):
     print("s_range:", float(s_uniform[0]), float(s_uniform[-1]))
     print("image_shape:", recon.shape)
     print("image_range:", float(recon.min()), float(recon.max()))
+    if mu_map is not None:
+        print("attn_map_shape:", mu_map.shape)
+        print("attn_map_range:", float(mu_map.min()), float(mu_map.max()))
     save_sinogram_amide(fbp_input_sino, s_by_bin_view, s_uniform, theta, args)
     if attenuation_specs:
         save_sinogram_amide(
@@ -605,6 +699,27 @@ def main():
         action="store_true",
         help="divide sinogram by exp(-integral mu dl) before FBP")
     parser.add_argument("--attenuation_eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--attn_map_size",
+        type=int,
+        default=320,
+        help="pixel size of the saved attenuation/mu map")
+    parser.add_argument(
+        "--output_attn_npz",
+        default=None,
+        help="attenuation/mu map npz; default derives *_attn_map.npz")
+    parser.add_argument(
+        "--output_attn_png",
+        default=None,
+        help="attenuation/mu map png; default derives *_attn_map.png")
+    parser.add_argument(
+        "--no_attn_map",
+        action="store_true",
+        help="disable default attenuation map npz output")
+    parser.add_argument(
+        "--no_attn_map_png",
+        action="store_true",
+        help="disable default attenuation map png output")
     parser.add_argument("--log_transform", action="store_true",
                         help="use -log(I/I0), for transmission CT data only")
     parser.add_argument("--log_epsilon", type=float, default=1e-6)
