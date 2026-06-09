@@ -13,3 +13,4 @@ test/output/
 *.mich
 test/output/
 *.mich
+*.raw
